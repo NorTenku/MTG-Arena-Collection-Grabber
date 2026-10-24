@@ -245,6 +245,99 @@ def extract_candidate(handle, anchor):
     }
 
 
+def group_candidates(candidates):
+    """
+    Group extracted candidates by their complete
+    card-ID and quantity mappings.
+
+    Each candidate must contain:
+      - anchor
+      - extracted
+      - classification (optional)
+    """
+    groups = {}
+
+    for candidate in candidates:
+        records = records_from_flat_list(
+            candidate["extracted"]["records"]
+        )
+
+        # Include every observed quantity for each ID.
+        # This ensures conflicting quantities are not
+        # silently discarded.
+        signature = tuple(
+            sorted(
+                (
+                    card_id,
+                    tuple(sorted(quantities)),
+                )
+                for card_id, quantities in records.items()
+            )
+        )
+
+        groups.setdefault(signature, []).append(candidate)
+
+    return list(groups.values())
+
+
+
+def load_ownership_checks(path):
+    with path.open("r", encoding="utf-8") as file:
+        data = json.load(file)
+
+    checks = {}
+
+    for card_id, entry in data.items():
+        quantity = int(entry["quantity"])
+
+        if not 0 <= quantity <= 4:
+            raise ValueError(
+                f"Invalid quantity for card {card_id}: {quantity}"
+            )
+
+        checks[int(card_id)] = {
+            "name": entry["name"],
+            "quantity": quantity,
+        }
+
+    if not checks:
+        raise ValueError("Ownership checks file is empty.")
+
+    return checks
+
+
+def check_candidate_ownership(records, checks):
+    """
+    Compare a candidate's observed quantities against
+    independently verified ownership checks.
+    """
+    observed = records_from_flat_list(records)
+
+    results = {}
+    valid = True
+
+    for card_id, check in checks.items():
+        quantities = observed.get(card_id, set())
+        expected = check["quantity"]
+
+        if expected == 0:
+            passed = not quantities
+        else:
+            passed = quantities == {expected}
+
+        if not passed:
+            valid = False
+
+        results[str(card_id)] = {
+            "name": check["name"],
+            "expected": expected,
+            "observed": sorted(quantities),
+            "passed": passed,
+        }
+
+    return valid, results
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Extract provisional MTG Arena collection records."
@@ -280,6 +373,24 @@ def main():
         "--list-candidates",
         action="store_true",
         help="Discover, extract, and classify all candidate regions",
+    )
+
+    parser.add_argument(
+        "--group-candidates",
+        action="store_true",
+        help="Group candidate regions by identical card IDs and quantities",
+    )
+
+    parser.add_argument(
+        "--auto-select",
+        action="store_true",
+        help="Select a collection candidate using verified ownership checks",
+    )
+
+    parser.add_argument(
+        "--ownership-checks",
+        type=Path,
+        help="JSON file containing independently verified card quantities",
     )
 
     parser.add_argument(
@@ -391,7 +502,74 @@ def main():
 
         return
 
+    
+    if args.group_candidates:
+        anchors = discover_inventory_anchors(pid)
 
+        print(
+            f"Discovered {len(anchors)} candidate anchor(s)"
+        )
+
+        handle = open_process(pid)
+
+        try:
+            candidates = []
+
+            for anchor in anchors:
+                extracted = extract_candidate(handle, anchor)
+
+                candidates.append({
+                    "anchor": anchor,
+                    "extracted": extracted,
+                })
+
+        finally:
+            kernel32.CloseHandle(handle)
+
+        groups = group_candidates(candidates)
+
+        print(
+            f"Distinct candidate datasets: {len(groups)}"
+        )
+
+        for index, group in enumerate(groups, 1):
+            representative = group[0]["extracted"]
+
+            records = records_from_flat_list(
+                representative["records"]
+            )
+
+            conflicts = sum(
+                len(quantities) > 1
+                for quantities in records.values()
+            )
+
+            print(f"\nGroup {index}")
+            print("-" * 50)
+
+            print(f"Matching candidates: {len(group)}")
+            print(f"Unique IDs: {len(records):,}")
+            print(f"Quantity conflicts: {conflicts}")
+
+            print("Anchors:")
+
+            for candidate in group:
+                print(
+                    f"  0x{candidate['anchor']:X}"
+                )
+
+            print("Reference validation:")
+
+            for reference in representative["validation"].values():
+                print(
+                    f"  {reference['name']}: "
+                    f"{reference['status']} "
+                    f"(observed={reference['observed']})"
+                )
+
+        return
+
+        
     if args.output is None and not args.list_candidates:
         parser.error(
             "--output is required unless --list-anchors "
@@ -411,13 +589,109 @@ def main():
     # Print classification results.
     # Return without exporting.
 
-    if args.anchor is not None:
-        anchor = args.anchor
-        print(f"Using supplied anchor: 0x{anchor:X}")
+
+    if args.auto_select:
+        if args.anchor is not None:
+            parser.error(
+                "--auto-select cannot be combined with --anchor"
+            )
+
+        if args.ownership_checks is None:
+            parser.error(
+                "--ownership-checks is required with --auto-select"
+            )
+
+        if args.output is None:
+            parser.error(
+                "--output is required with --auto-select"
+            )
+
+        checks = load_ownership_checks(args.ownership_checks)
+        anchors = discover_inventory_anchors(pid)
+
+        print(f"Discovered {len(anchors)} candidate anchor(s)")
+
+        handle = open_process(pid)
+
+        try:
+            candidates = []
+
+            for anchor in anchors:
+                extracted = extract_candidate(handle, anchor)
+
+                candidates.append({
+                    "anchor": anchor,
+                    "extracted": extracted,
+                })
+
+        finally:
+            kernel32.CloseHandle(handle)
+
+        groups = group_candidates(candidates)
+        passing_groups = []
+
+        for index, group in enumerate(groups, 1):
+            representative = group[0]["extracted"]
+
+            passed, results = check_candidate_ownership(
+                representative["records"],
+                checks,
+            )
+
+            print(
+                f"Group {index}: "
+                f"{len(group)} matching candidate(s), "
+                f"{len(records_from_flat_list(representative['records'])):,} IDs"
+            )
+
+            for result in results.values():
+                status = "PASS" if result["passed"] else "FAIL"
+
+                print(
+                    f"  {result['name']}: {status} "
+                    f"(expected={result['expected']}, "
+                    f"observed={result['observed']})"
+                )
+
+            if passed:
+                passing_groups.append(group)
+
+        if len(passing_groups) != 1:
+            raise RuntimeError(
+                "Automatic selection requires exactly one "
+                "candidate group passing all ownership checks; "
+                f"found {len(passing_groups)}."
+            )
+
+        selected_group = passing_groups[0]
+
+        # Prefer the smallest readable region among
+        # equivalent candidate datasets.
+        selected_candidate = min(
+            selected_group,
+            key=lambda candidate: (
+                candidate["extracted"]["region_size"],
+                candidate["anchor"],
+            ),
+        )
+
+        anchor = selected_candidate["anchor"]
+
+        print(f"Selected anchor: 0x{anchor:X}")
+
     else:
-        print("Discovering inventory anchor...")
-        anchor = discover_inventory_anchor(pid)
-        print(f"Discovered inventory anchor: 0x{anchor:X}")
+        if args.output is None:
+            parser.error(
+                "--output is required for collection extraction"
+            )
+
+        if args.anchor is not None:
+            anchor = args.anchor
+            print(f"Using supplied anchor: 0x{anchor:X}")
+        else:
+            print("Discovering inventory anchor...")
+            anchor = discover_inventory_anchor(pid)
+            print(f"Discovered inventory anchor: 0x{anchor:X}")
 
     handle = open_process(pid)
 
@@ -502,6 +776,7 @@ def main():
             ],
         })
 
+
     output = {
         "status": "provisional",
         "source": "mtga_process_memory",
@@ -513,7 +788,18 @@ def main():
         "anchor_run_length": len(selected),
         "reference_validation": validation,
         "runs": export_runs,
+        "selection_method": (
+            "ownership_checks"
+            if args.auto_select
+            else "manual_or_single_anchor"
+        ),
+        "selection_group_anchors": (
+            [hex(candidate["anchor"]) for candidate in selected_group]
+            if args.auto_select
+            else [hex(anchor)]
+        ),
     }
+
 
     args.output.parent.mkdir(
         parents=True,
