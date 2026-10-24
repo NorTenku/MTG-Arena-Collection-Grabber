@@ -5,7 +5,9 @@ from collections import Counter
 from pathlib import Path
 
 
-COLLECTION_PATH = Path("data/collection_prototype.json")
+COLLECTION_PATH = Path(
+    "data/snapshots/collection_screen_new.json"
+)
 SCRYFALL_PATH = Path("data/scryfall_default_cards.jsonl.gz")
 
 

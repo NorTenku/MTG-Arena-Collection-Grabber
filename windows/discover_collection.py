@@ -228,14 +228,11 @@ def scan_region(handle, base, size):
     return matches
 
 
-def discover_inventory_anchor(pid):
+
+def discover_inventory_anchors(pid):
     """
-    Discover the inventory anchor in a running MTG Arena process.
-
-    Return the Charmed Stray record address when exactly one
-    readable region contains all three reference signatures.
-
-    Raise RuntimeError if no match or multiple matches exist.
+    Discover all memory addresses containing the expected
+    reference-card signatures.
     """
     handle = open_process(pid)
     candidates = []
@@ -245,8 +242,7 @@ def discover_inventory_anchor(pid):
             matches = scan_region(handle, base, size)
 
             if all(matches[name] for name in SIGNATURES):
-                for anchor in matches["Charmed Stray"]:
-                    candidates.append(anchor)
+                candidates.extend(matches["Charmed Stray"])
 
     finally:
         kernel32.CloseHandle(handle)
@@ -255,20 +251,25 @@ def discover_inventory_anchor(pid):
 
     if not candidates:
         raise RuntimeError(
-            "No validated inventory anchor found. "
-            "Make sure Arena is fully loaded and "
-            "the reference quantities are unchanged."
+            "No validated inventory anchors found. "
+            "Make sure Arena is fully loaded and the "
+            "reference quantities are unchanged."
         )
 
-    if len(candidates) > 1:
-        formatted = ", ".join(
-            f"0x{address:X}" for address in candidates
-        )
+    return candidates
 
+
+def discover_inventory_anchor(pid):
+    """
+    Compatibility wrapper for callers expecting one anchor.
+    """
+    candidates = discover_inventory_anchors(pid)
+
+    if len(candidates) != 1:
         raise RuntimeError(
             "Multiple inventory anchors found: "
-            f"{formatted}. "
-            "Automatic selection is ambiguous."
+            + ", ".join(f"0x{address:X}" for address in candidates)
+            + ". Candidate classification is required."
         )
 
     return candidates[0]

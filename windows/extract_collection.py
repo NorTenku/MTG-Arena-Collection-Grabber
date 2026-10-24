@@ -4,12 +4,19 @@ import ctypes
 import json
 import struct
 import sys
-from discover_collection import discover_inventory_anchor
+from discover_collection import (
+    discover_inventory_anchor,
+    discover_inventory_anchors,
+)
 from find_arena import find_arena_pid
 from datetime import datetime, timezone
 from pathlib import Path
 from ctypes import wintypes
-
+from collection_classifier import (
+    classify_candidate,
+    load_baseline,
+    records_from_flat_list,
+)
 
 PROCESS_VM_READ = 0x0010
 PROCESS_QUERY_INFORMATION = 0x0400
@@ -217,6 +224,26 @@ def validate(records):
     return results
 
 
+def extract_candidate(handle, anchor):
+    region_base, region_size = get_region(handle, anchor)
+
+    data = read_memory(
+        handle,
+        region_base,
+        region_size,
+    )
+
+    records = find_records(data, region_base)
+
+    return {
+        "anchor": anchor,
+        "region_base": region_base,
+        "region_size": region_size,
+        "records": records,
+        "runs": group_runs(records),
+        "validation": validate(records),
+    }
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -238,16 +265,151 @@ def main():
     )
 
     parser.add_argument(
-        "--output",
+        "--list-anchors",
+        action="store_true",
+        help="Discover and print all candidate inventory anchors",
+    )
+
+    parser.add_argument(
+        "--baseline",
         type=Path,
-        required=True,
-        help="Destination JSON file",
+        help="Provisional collection snapshot used to classify candidates",
+    )
+
+    parser.add_argument(
+        "--list-candidates",
+        action="store_true",
+        help="Discover, extract, and classify all candidate regions",
+    )
+
+    parser.add_argument(
+        "--output", 
+        type=Path
     )
 
     args = parser.parse_args()
 
     pid = args.pid if args.pid is not None else find_arena_pid()
     print(f"Using MTG Arena PID: {pid}")
+
+    if args.list_anchors:
+        anchors = discover_inventory_anchors(pid)
+
+        print(f"Discovered {len(anchors)} inventory anchor(s):")
+
+        for anchor in anchors:
+            print(f"  0x{anchor:X}")
+
+        return
+
+    
+    if args.list_candidates:
+        if args.baseline is None:
+            parser.error(
+                "--baseline is required with --list-candidates"
+            )
+
+        baseline = load_baseline(args.baseline)
+        anchors = discover_inventory_anchors(pid)
+
+        print(
+            f"Discovered {len(anchors)} candidate anchor(s)"
+        )
+        print(
+            f"Baseline contains {len(baseline):,} unique IDs"
+        )
+
+        handle = open_process(pid)
+
+        try:
+            candidates = []
+
+            for anchor in anchors:
+                extracted = extract_candidate(handle, anchor)
+
+                candidate_records = records_from_flat_list(
+                    extracted["records"]
+                )
+
+                classification = classify_candidate(
+                    baseline,
+                    candidate_records,
+                )
+
+                candidates.append({
+                    "anchor": anchor,
+                    "extracted": extracted,
+                    "classification": classification,
+                })
+
+        finally:
+            kernel32.CloseHandle(handle)
+
+        for index, candidate in enumerate(candidates, 1):
+            result = candidate["classification"]
+            extracted = candidate["extracted"]
+
+            print(f"\nCandidate {index}")
+            print("-" * 50)
+            print(f"Anchor: 0x{candidate['anchor']:X}")
+            print(
+                f"Region size: "
+                f"{extracted['region_size']:,} bytes"
+            )
+            print(
+                f"Unique IDs: "
+                f"{result['candidate_count']:,}"
+            )
+            print(
+                f"Baseline coverage: "
+                f"{result['coverage']:.2%}"
+            )
+            print(
+                f"Baseline precision: "
+                f"{result['precision']:.2%}"
+            )
+            print(
+                f"Quantity agreement: "
+                f"{result['quantity_agreement']:.2%}"
+            )
+            print(
+                f"Quantity mismatches: "
+                f"{result['quantity_mismatches']}"
+            )
+            print(
+                f"Internal conflicts: "
+                f"{result['conflicts']}"
+            )
+
+            print("Reference validation:")
+
+            for reference in extracted["validation"].values():
+                print(
+                    f"  {reference['name']}: "
+                    f"{reference['status']}"
+                )
+
+        return
+
+
+    if args.output is None and not args.list_candidates:
+        parser.error(
+            "--output is required unless --list-anchors "
+            "or --list-candidates is specified"
+        )
+
+    if args.list_candidates:
+        if args.baseline is None:
+            parser.error(
+                "--baseline is required with --list-candidates"
+            )
+
+    # Discover every candidate anchor.
+    # Read each candidate's memory region.
+    # Extract records from each region.
+    # Compare records against the baseline.
+    # Print classification results.
+    # Return without exporting.
 
     if args.anchor is not None:
         anchor = args.anchor
