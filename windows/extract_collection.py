@@ -4,6 +4,7 @@ import ctypes
 import json
 import struct
 import sys
+from discover_collection import discover_inventory_anchor
 from find_arena import find_arena_pid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -232,8 +233,8 @@ def main():
     parser.add_argument(
         "--anchor",
         type=lambda value: int(value, 0),
-        required=True,
-        help="Known collection record address (hex or decimal)",
+        default=None,
+        help="Override automatic inventory anchor discovery",
     )
 
     parser.add_argument(
@@ -246,8 +247,15 @@ def main():
     args = parser.parse_args()
 
     pid = args.pid if args.pid is not None else find_arena_pid()
-
     print(f"Using MTG Arena PID: {pid}")
+
+    if args.anchor is not None:
+        anchor = args.anchor
+        print(f"Using supplied anchor: 0x{anchor:X}")
+    else:
+        print("Discovering inventory anchor...")
+        anchor = discover_inventory_anchor(pid)
+        print(f"Discovered inventory anchor: 0x{anchor:X}")
 
     handle = open_process(pid)
 
@@ -255,7 +263,7 @@ def main():
     try:
         region_base, region_size = get_region(
             handle,
-            args.anchor,
+            anchor,
         )
 
         region_end = region_base + region_size
@@ -289,7 +297,7 @@ def main():
     anchor_runs = [
         run for run in runs
         if any(
-            item["address"] == args.anchor
+            item["address"] == anchor
             and item["card_id"] == ANCHOR_ID
             and item["quantity"] == 4
             for item in run
@@ -337,7 +345,7 @@ def main():
         "source": "mtga_process_memory",
         "extracted_at": datetime.now(timezone.utc).isoformat(),
         "pid": pid,
-        "anchor_address": hex(args.anchor),
+        "anchor_address": hex(anchor),
         "scan_start": hex(start),
         "scan_bytes": len(data),
         "anchor_run_length": len(selected),
