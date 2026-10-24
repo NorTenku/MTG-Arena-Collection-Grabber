@@ -4,6 +4,7 @@ import ctypes
 import json
 import struct
 import sys
+from find_arena import find_arena_pid
 from datetime import datetime, timezone
 from pathlib import Path
 from ctypes import wintypes
@@ -215,21 +216,41 @@ def validate(records):
     return results
 
 
+
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("pid", type=int)
-    parser.add_argument(
-        "anchor",
-        type=lambda value: int(value, 0),
+    parser = argparse.ArgumentParser(
+        description="Extract provisional MTG Arena collection records."
     )
+
+    parser.add_argument(
+        "--pid",
+        type=int,
+        default=None,
+        help="MTG Arena PID (automatically detected if omitted)",
+    )
+
+    parser.add_argument(
+        "--anchor",
+        type=lambda value: int(value, 0),
+        required=True,
+        help="Known collection record address (hex or decimal)",
+    )
+
     parser.add_argument(
         "--output",
         type=Path,
         required=True,
+        help="Destination JSON file",
     )
+
     args = parser.parse_args()
 
-    handle = open_process(args.pid)
+    pid = args.pid if args.pid is not None else find_arena_pid()
+
+    print(f"Using MTG Arena PID: {pid}")
+
+    handle = open_process(pid)
+
 
     try:
         region_base, region_size = get_region(
@@ -315,7 +336,7 @@ def main():
         "status": "provisional",
         "source": "mtga_process_memory",
         "extracted_at": datetime.now(timezone.utc).isoformat(),
-        "pid": args.pid,
+        "pid": pid,
         "anchor_address": hex(args.anchor),
         "scan_start": hex(start),
         "scan_bytes": len(data),
