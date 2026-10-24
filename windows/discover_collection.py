@@ -33,23 +33,33 @@ CHUNK_SIZE = 1024 * 1024
 # Windows 64-bit user address-space upper bound.
 MAX_ADDRESS = 0x00007FFFFFFFFFFF
 
-# Confirmed reference records from our earlier tests.
+
+# Reference cards used to locate candidate inventory structures.
+# Quantities are deliberately excluded from discovery.
 REFERENCES = {
-    "Charmed Stray": (75446, 4),
-    "Fleeting Flight": (93726, 1),
-    "Healer's Hawk": (93855, 2),
+    "Charmed Stray": 75446,
+    "Fleeting Flight": 93726,
+    "Healer's Hawk": 93855,
 }
 
+RECORD = struct.Struct("<IIII")
+MARKER = 0xFFFFFFFF
+
+# Match the first 12 bytes:
+# card_id | 0xFFFFFFFF | card_id
+#
+# The final four bytes contain the quantity, which is
+# inspected separately.
 SIGNATURES = {
     name: struct.pack(
-        "<IIII",
+        "<III",
         card_id,
-        0xFFFFFFFF,
+        MARKER,
         card_id,
-        quantity,
     )
-    for name, (card_id, quantity) in REFERENCES.items()
+    for name, card_id in REFERENCES.items()
 }
+
 
 
 class MEMORY_BASIC_INFORMATION(ctypes.Structure):
@@ -178,6 +188,7 @@ def read_chunk(handle, address, size):
     return buffer.raw[:bytes_read.value]
 
 
+
 def scan_region(handle, base, size):
     matches = {
         name: []
@@ -185,8 +196,11 @@ def scan_region(handle, base, size):
     }
 
     offset = 0
-    overlap = max(len(sig) for sig in SIGNATURES.values()) - 1
     tail = b""
+
+    # Preserve enough bytes to detect records crossing
+    # chunk boundaries.
+    overlap = RECORD.size - 1
 
     while offset < size:
         length = min(CHUNK_SIZE, size - offset)
@@ -195,7 +209,6 @@ def scan_region(handle, base, size):
         data = read_chunk(handle, address, length)
 
         if not data:
-            # A failed read invalidates continuity.
             tail = b""
             offset += length
             continue
@@ -215,10 +228,23 @@ def scan_region(handle, base, size):
                 if position == -1:
                     break
 
-                match_address = combined_base + position
+                record_end = position + RECORD.size
 
-                if match_address % 4 == 0:
-                    matches[name].append(match_address)
+                if record_end <= len(combined):
+                    match_address = combined_base + position
+
+                    if match_address % 4 == 0:
+                        quantity = struct.unpack_from(
+                            "<I",
+                            combined,
+                            position + 12,
+                        )[0]
+
+                        if 1 <= quantity <= 4:
+                            matches[name].append({
+                                "address": match_address,
+                                "quantity": quantity,
+                            })
 
                 search_from = position + 1
 
@@ -242,7 +268,10 @@ def discover_inventory_anchors(pid):
             matches = scan_region(handle, base, size)
 
             if all(matches[name] for name in SIGNATURES):
-                candidates.extend(matches["Charmed Stray"])
+                candidates.extend(
+                    match["address"]
+                    for match in matches["Charmed Stray"]
+                )
 
     finally:
         kernel32.CloseHandle(handle)
@@ -362,8 +391,9 @@ def main():
         for name, addresses in matches.items():
             if addresses:
                 formatted = ", ".join(
-                    hex(address)
-                    for address in addresses[:5]
+                    f"0x{match['address']:X} "
+                    f"(quantity={match['quantity']})"
+                    for match in addresses[:5]
                 )
 
                 print(f"  {name}: {formatted}")
@@ -386,7 +416,7 @@ def main():
         print("\nSuggested extraction anchors:")
 
         for candidate in validated:
-            anchor = candidate["matches"]["Charmed Stray"][0]
+            anchor = candidate["matches"]["Charmed Stray"][0]["address"]
             print(f"  0x{anchor:X}")
 
     else:

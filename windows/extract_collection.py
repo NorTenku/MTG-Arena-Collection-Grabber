@@ -33,7 +33,7 @@ MAX_SCAN_BYTES = 8 * 1024 * 1024
 
 REFERENCE_CARDS = {
     75446: ("Charmed Stray", 4),
-    93726: ("Fleeting Flight", 1),
+    93726: ("Fleeting Flight", 2),
     93855: ("Healer's Hawk", 2),
     67692: ("Ajani's Welcome", 0),
 }
@@ -461,7 +461,7 @@ def main():
         if any(
             item["address"] == anchor
             and item["card_id"] == ANCHOR_ID
-            and item["quantity"] == 4
+            and 1 <= item["quantity"] <= 4
             for item in run
         )
     ]
