@@ -570,25 +570,10 @@ def main():
         return
 
         
-    if args.output is None and not args.list_candidates:
-        parser.error(
-            "--output is required unless --list-anchors "
-            "or --list-candidates is specified"
-        )
+    if args.output is None:
+        parser.error("--output is required for collection extraction")
 
-    if args.list_candidates:
-        if args.baseline is None:
-            parser.error(
-                "--baseline is required with --list-candidates"
-            )
-
-    # Discover every candidate anchor.
-    # Read each candidate's memory region.
-    # Extract records from each region.
-    # Compare records against the baseline.
-    # Print classification results.
-    # Return without exporting.
-
+    selected_extraction = None
 
     if args.auto_select:
         if args.anchor is not None:
@@ -677,6 +662,8 @@ def main():
 
         anchor = selected_candidate["anchor"]
 
+        selected_extraction = selected_candidate["extracted"]
+
         print(f"Selected anchor: 0x{anchor:X}")
 
     else:
@@ -693,39 +680,28 @@ def main():
             anchor = discover_inventory_anchor(pid)
             print(f"Discovered inventory anchor: 0x{anchor:X}")
 
-    handle = open_process(pid)
+    # Reuse the validated snapshot in auto-select mode.
+    # Manual extraction still reads the selected region once.
+    if selected_extraction is not None:
+        extracted = selected_extraction
+    else:
+        handle = open_process(pid)
+        try:
+            extracted = extract_candidate(handle, anchor)
+        finally:
+            kernel32.CloseHandle(handle)
 
+    start = extracted["region_base"]
+    region_size = extracted["region_size"]
+    scan_bytes = region_size
+    records = extracted["records"]
+    runs = extracted["runs"]
+    validation = extracted["validation"]
 
-    try:
-        region_base, region_size = get_region(
-            handle,
-            anchor,
-        )
-
-        region_end = region_base + region_size
-
-        start = region_base
-        end = region_end
-
-        # Preserve 4-byte alignment relative to the region.
-        start -= (start - region_base) % 4
-
-        print(f"Region base: 0x{region_base:X}")
-        print(f"Region size: {region_size:,} bytes")
-        print(f"Scan start: 0x{start:X}")
-        print(f"Scan size: {end - start:,} bytes")
-
-        data = read_memory(
-            handle,
-            start,
-            end - start,
-        )
-
-    finally:
-        kernel32.CloseHandle(handle)
-
-    records = find_records(data, start)
-    runs = group_runs(records)
+    print(f"Region base: 0x{start:X}")
+    print(f"Region size: {region_size:,} bytes")
+    print(f"Scan start: 0x{start:X}")
+    print(f"Scan size: {scan_bytes:,} bytes")
 
     print(f"Candidate records: {len(records):,}")
     print(f"Contiguous runs: {len(runs):,}")
@@ -747,8 +723,6 @@ def main():
         )
 
     selected = anchor_runs[0]
-    validation = validate(records)
-
     print(f"Anchor run length: {len(selected):,}")
 
     for item in validation.values():
@@ -784,7 +758,7 @@ def main():
         "pid": pid,
         "anchor_address": hex(anchor),
         "scan_start": hex(start),
-        "scan_bytes": len(data),
+        "scan_bytes": scan_bytes,
         "anchor_run_length": len(selected),
         "reference_validation": validation,
         "runs": export_runs,
