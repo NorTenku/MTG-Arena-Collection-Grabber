@@ -173,6 +173,8 @@ def assess_run(window, reference, controls):
     history = compare_historical_controls(rows, controls)
     differences = compute_reference_changes(rows, reference)
     signature = tuple((r['card_id'], r['field_a'], r['field_b']) for r in rows)
+    # MTGA_OWNERSHIP_CONSENSUS_V1: compare the ownership-bearing fields only.
+    ownership_signature = tuple((r['card_id'], r['field_b']) for r in rows)
     return {
         'valid': not reasons, 'reasons': reasons,
         'coverage': coverage, 'quantity_agreement': qty_agreement,
@@ -180,8 +182,90 @@ def assess_run(window, reference, controls):
         'reference_missing': len(differences['no_longer_present']),
         'reference_quantity_changes': len(differences['quantity_changed']),
         'historical_checks': history, 'differences': differences,
-        'signature': signature, 'count': len(rows),
+        'signature': signature, 'ownership_signature': ownership_signature,
+        'count': len(rows),
     }
+
+
+# MTGA_CONSENSUS_DIAGNOSTICS_V1
+
+def print_consensus_diagnostics(inspected, sample_limit=12):
+    """Compare VALID complete copies only; diagnostics never authorise export.
+
+    IDs, quantities, record formats, field A, and row ordering are compared
+    independently, so differing metadata cannot be mistaken for ownership drift.
+    """
+    valid = [(win, assessment) for win, assessment in inspected if assessment['valid']]
+    print('\nCONSENSUS DIAGNOSTICS (read-only; no snapshot accepted):', flush=True)
+    print(f'  Passing structural/reference checks: {len(valid)} distinct runs', flush=True)
+    for index, (win, assessment) in enumerate(valid[:8], 1):
+        rows = win['seed_records']
+        source = int(rows[0]['address'], 16)
+        quantities = {r['card_id']: r['field_b'] for r in rows}
+        digest = hashlib.sha256(json.dumps(sorted(quantities.items()),
+                        separators=(',', ':')).encode('utf-8')).hexdigest()[:16]
+        print(f'  Copy {index}: {source:#x}; records={len(rows)}, '
+              f'owned-id/quantity digest={digest}', flush=True)
+    if len(valid) < 2:
+        print('  Fewer than two valid copies: no pairwise comparison is possible.', flush=True)
+        return
+    for i in range(min(len(valid), 8)):
+        for j in range(i + 1, min(len(valid), 8)):
+            a, b = (valid[i][0]['seed_records'], valid[j][0]['seed_records'])
+            amap, bmap = ({r['card_id']: r for r in a}, {r['card_id']: r for r in b})
+            ids_a, ids_b = set(amap), set(bmap)
+            only_a, only_b = sorted(ids_a - ids_b), sorted(ids_b - ids_a)
+            both = sorted(ids_a & ids_b)
+            quantity_diffs = [cid for cid in both if
+                              amap[cid]['field_b'] != bmap[cid]['field_b']]
+            format_diffs = [cid for cid in both if
+                            amap[cid]['format'] != bmap[cid]['format']]
+            field_a_diffs = [cid for cid in both if
+                             amap[cid]['field_a'] != bmap[cid]['field_a']]
+            positions_a = {r['card_id']: k for k, r in enumerate(a)}
+            positions_b = {r['card_id']: k for k, r in enumerate(b)}
+            moved = [cid for cid in both if positions_a[cid] != positions_b[cid]]
+            exact_ownership = (not only_a and not only_b and not quantity_diffs)
+            print(f'  Compare copies {i+1} and {j+1}:', flush=True)
+            print(f'    ID-only-A={len(only_a)}, ID-only-B={len(only_b)}, '
+                  f'quantity disagreements={len(quantity_diffs)}', flush=True)
+            print(f'    Field A disagreements={len(field_a_diffs)}, '
+                  f'format disagreements={len(format_diffs)}, '
+                  f'row position disagreements={len(moved)}', flush=True)
+            print('    Identical ownership ID/quantity mapping: '
+                  + ('YES' if exact_ownership else 'NO'), flush=True)
+            for label, ids in (
+                ('only copy A', only_a), ('only copy B', only_b),
+                ('quantity disagreements', quantity_diffs),
+                ('field A disagreements', field_a_diffs),
+                ('format disagreements', format_diffs),
+                ('position disagreements', moved),
+            ):
+                if not ids:
+                    continue
+                print(f'    Sample {label} (at most {sample_limit}):', flush=True)
+                for cid in ids[:sample_limit]:
+                    ra, rb = amap.get(cid), bmap.get(cid)
+                    if ra is not None and rb is not None:
+                        print(f'      {cid}: A=(qty {ra["field_b"]}, '
+                              f'field_a {ra["field_a"]}, format {ra["format"]}, '
+                              f'row {positions_a[cid]}); B=(qty {rb["field_b"]}, '
+                              f'field_a {rb["field_a"]}, format {rb["format"]}, '
+                              f'row {positions_b[cid]})', flush=True)
+                    else:
+                        print(f'      {cid}: present in '
+                              f'{"A" if ra is not None else "B"} only', flush=True)
+            if exact_ownership:
+                print('    NOTE: Ownership agrees, but strict ordered-triple '
+                      'consensus still does not. Do not loosen validation '
+                      'until the differing fields are understood.', flush=True)
+            else:
+                print('    NOTE: Ownership itself differs between copies; '
+                      'do not export either as verified.', flush=True)
+    if len(valid) > 8:
+        print(f'  Only first 8 of {len(valid)} passing copies compared.', flush=True)
+    print('  No raw memory dumped; no collection output written by diagnostics.\n',
+          flush=True)
 
 def select_consensus(windows, reference, controls):
     """Validate each complete run; require ONE passing group at >=2 locations."""
@@ -196,8 +280,10 @@ def select_consensus(windows, reference, controls):
         review = assess_run(window, reference, controls)
         inspected.append((window, review))
         if review['valid']:
-            groups[review['signature']].append((window, review))
+            groups[review['ownership_signature']].append((window, review))
     passing = [members for members in groups.values() if len(members) >= 2]
+    if len(passing) != 1:
+        print_consensus_diagnostics(inspected)
     require(len(passing) == 1,
             f'Need exactly one validated dataset found in 2+ locations; '
             f'found {len(passing)}. Distinct complete runs examined: {len(inspected)}. '
@@ -216,6 +302,30 @@ def build_payload(pid, selected, reference_path, reference, scanned_count):
     start = int(rows[0]['address'], 16)
     triples = [[r['card_id'], r['field_a'], r['field_b']] for r in rows]
     digest = hashlib.sha256(json.dumps(triples, separators=(',', ':')).encode()).hexdigest()
+    ownership_rows = [[r['card_id'], r['field_b']] for r in rows]
+    ownership_digest = hashlib.sha256(json.dumps(
+        ownership_rows, separators=(',', ':')).encode()).hexdigest()
+    # Recheck agreement at serialization, even if consensus was selected above.
+    require(len(windows) >= 2, 'Fewer than two physically distinct collection copies')
+    require(len({int(w['seed_records'][0]['address'], 16) for w in windows}) >= 2,
+            'Collection copies share the same memory start')
+    for other in windows[1:]:
+        candidate = [(r['card_id'], r['field_b']) for r in other['seed_records']]
+        require(candidate == [(r['card_id'], r['field_b']) for r in rows],
+                'Ownership changed between selected copies')
+    field_a_disagreements = sorted({
+        row['card_id']
+        for other in windows[1:]
+        for row, other_row in zip(rows, other['seed_records'])
+        if row['field_a'] != other_row['field_a']
+    })
+    format_disagreements = sorted({
+        row['card_id']
+        for other in windows[1:]
+        for row, other_row in zip(rows, other['seed_records'])
+        if row['format'] != other_row['format']
+    })
+    strict_record_consensus = not field_a_disagreements and not format_disagreements
     return {
         'status': 'candidate_unconfirmed',
         'source': 'mtga_process_memory_read_only_mixed_format_autodiscovery',
@@ -225,7 +335,7 @@ def build_payload(pid, selected, reference_path, reference, scanned_count):
         'scan_start': hex(start),
         'scan_bytes': RECORD.size * len(rows),
         'anchor_run_length': len(rows),
-        'selection_method': 'autodiscovery_matching_contiguous_mixed_runs_change_aware',
+        'selection_method': 'autodiscovery_ordered_ownership_consensus_change_aware',
         'selection_group_anchors': [w['anchor'] for w in windows],
         'selection_group_run_starts': [w['seed_records'][0]['address'] for w in windows],
         'reference_source': str(reference_path),
@@ -240,12 +350,21 @@ def build_payload(pid, selected, reference_path, reference, scanned_count):
         'historical_ownership_checks': summary['historical_checks'],
         'reference_changes': summary['differences'],
         'ownership_validation_policy': ('historical UI checks are advisory; ' 
-            'two matching complete sequences and strong reference similarity required'),
+            'two physically distinct structurally valid complete sequences must agree ' 
+            'on ordered Arena IDs and quantities; field_a and format are NOT ' 
+            'corroborated when copies disagree; strong reference similarity required'),
         'mixed_format_audit': {
             'candidate_unique_ids': len(rows),
             'format_counts': dict(Counter(r['format'] for r in rows)),
             'matching_copies': len(windows),
-            'all_matching': True,
+            'all_matching': strict_record_consensus,
+            'ownership_consensus': True,
+            'consensus_basis': 'ordered_card_id_quantity',
+            'ownership_signature_sha256': ownership_digest,
+            'auxiliary_field_source': 'first_selected_physical_copy_only',
+            'auxiliary_field_a_disagreements': len(field_a_disagreements),
+            'auxiliary_format_disagreements': len(format_disagreements),
+            'auxiliary_disagreement_sample_ids': field_a_disagreements[:20],
             'record_signature_sha256': digest,
             'anchor_hits_examined': scanned_count,
         },
@@ -582,7 +701,16 @@ def main():
     payload = build_payload(pid, selected, args.reference, reference, len(anchors))
     fmt = payload['mixed_format_audit']['format_counts']
     print('\nPASS: exactly one validated dataset found')
-    print(f'  Matching physical copies: {len(selected)}')
+    print(f'  Ownership-agreeing physical copies: {len(selected)}')
+    aux = payload['mixed_format_audit']
+    print(f'  Ordered ID/quantity consensus: YES '
+          f'(sha256 {aux["ownership_signature_sha256"][:16]})')
+    print(f'  Auxiliary metadata: field_a disagrees on '
+          f'{aux["auxiliary_field_a_disagreements"]} IDs; '
+          f'format disagrees on {aux["auxiliary_format_disagreements"]} IDs')
+    if not aux['all_matching']:
+        print('  NOTE: exported field_a/format come from one physical copy; '
+              'their values are NOT cross-copy verified')
     print(f'  Candidate: {payload["anchor_run_length"]:,} Arena IDs, '
           f'{sum(r["quantity"] for r in payload["runs"][0]["records"]):,} copies')
     print(f'  Formats: sentinel={fmt.get("sentinel", 0):,}, '
